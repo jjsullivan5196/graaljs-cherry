@@ -7,6 +7,7 @@
    [clojure.java.io :as io]
    [clojure.string :as str])
   (:import
+   (clojure.lang LineNumberingPushbackReader)
    (java.net URI)
    (org.graalvm.polyglot Context PolyglotException Source Value)
    (org.graalvm.polyglot.io FileSystem IOAccess)
@@ -117,10 +118,14 @@
       (f (aget args 0))
       nil)))
 
+(defn- error->str [^Context ctx ^Value err]
+  (-> (.eval ctx "js" "(e) => (e instanceof Error && e.stack) ? e.stack : String(e)")
+      (.execute (object-array [err]))
+      (.asString)))
+
 (defn eval-await
-  "Eval `js-code` (which must evaluate to a promise) and wait for it to settle.
-  Returns [:ok Value] or [:err Value]."
-  [^Context ctx ^String js-code]
+  "Eval `js-code` (which must evaluate to a promise) and wait for it to settle."
+  ^Value [^Context ctx ^String js-code]
   (let [src (.buildLiteral (Source/newBuilder "js" js-code "<repl>"))
         p (.eval ctx src)
         result (promise)]
@@ -134,8 +139,13 @@
         (.eval ctx "js" "undefined")
         (recur (inc i))))
     (if (realized? result)
-      @result
-      [:err "timed out waiting for promise"])))
+      (let [[status ^Value v] @result]
+        (if (= :ok status)
+          (.getArrayElement v 0)
+          (throw (Exception. ^String (str (if (instance? Value v)
+                                            (error->str ctx v)
+                                            (str v)))))))
+      (throw (Exception. "timed out waiting for promise")))))
 
 (def ^:private bootstrap-js
   "(async function () {
@@ -164,95 +174,118 @@
 (defn bootstrap
   "Load cljs.core into the context; returns its module namespace Value."
   ^Value [^Context ctx]
-  (let [[status err] (eval-await ctx bootstrap-js)]
-    (when (= :err status)
-      (throw (ex-info (str "could not load cherry runtime: " err) {}))))
+  (eval-await ctx bootstrap-js)
   (.getMember (.getBindings ctx "js") "cherry_repl_core"))
-
-(defn- error->str [^Context ctx ^Value err]
-  (-> (.eval ctx "js" "(e) => (e instanceof Error && e.stack) ? e.stack : String(e)")
-      (.execute (object-array [err]))
-      (.asString)))
 
 ;;;; Compilation
 
 (defn compile-form
-  "Compile one repl input; returns [new-state js]. The compiled snippet is an
-  async IIFE resolving to the value in a one-element box (see squint's nrepl
-  server, which this mirrors)."
-  [state ^String code]
-  (let [{:keys [javascript] :as new-state}
-        (compiler/compile-string* code
-                                  {:context :repl-return
-                                   :repl true
-                                   :async true
-                                   :elide-exports true}
-                                  state)]
-    [new-state (str "(async function () {\n"
-                    javascript
-                    "\n;return [undefined];\n})()")]))
-
-(defn- incomplete-input? [e]
-  (some-> (ex-message e) (str/includes? "EOF while reading")))
+  "Compile one repl input. The compiled snippet is an async IIFE
+  resolving to the value in a one-element box."
+  [form state]
+  (let [form (if-not (string? form) form (pr-str form))
+        opts {:context       :repl-return
+              :repl          true
+              :async         true
+              :elide-exports true}
+        {:keys [javascript] :as new-state}
+        (compiler/compile-form* form (merge (or state {}) opts))]
+    (merge new-state
+           {:javascript (str "(async function () {\n"
+                             javascript
+                             "\n;return [undefined];\n})()")})))
 
 ;;;; REPL
 
+;;;;;;; from clojure.main
+
+
+(defn skip-if-eol
+  "If the next character on stream s is a newline, skips it, otherwise
+  leaves the stream untouched. Returns :line-start, :stream-end, or :body
+  to indicate the relative location of the next character on s. The stream
+  must either be an instance of LineNumberingPushbackReader or duplicate
+  its behavior of both supporting .unread and collapsing all of CR, LF, and
+  CRLF to a single \\newline."
+  [^LineNumberingPushbackReader s]
+  (let [c (.read s)]
+    (cond
+      (= c (int \newline)) :line-start
+      (= c -1) :stream-end
+      :else (do (.unread s c) :body))))
+
+(defn skip-whitespace
+  "Skips whitespace characters on stream s. Returns :line-start, :stream-end,
+  or :body to indicate the relative location of the next character on s.
+  Interprets comma as whitespace and semicolon as comment to end of line.
+  Does not interpret #! as comment to end of line because only one
+  character of lookahead is available. The stream must either be an
+  instance of LineNumberingPushbackReader or duplicate its behavior of both
+  supporting .unread and collapsing all of CR, LF, and CRLF to a single
+  \\newline."
+  [^LineNumberingPushbackReader s]
+  (loop [c (.read s)]
+    (cond
+     (= c (int \newline)) :line-start
+     (= c -1) :stream-end
+     (= c (int \;)) (do (.readLine s) :line-start)
+     (or (Character/isWhitespace (char c)) (= c (int \,))) (recur (.read s))
+     :else (do (.unread s c) :body))))
+
+(defn cljs-repl-read
+  [request-prompt request-exit]
+  (or ({:line-start request-prompt :stream-end request-exit}
+       (skip-whitespace *in*))
+      (let [input (read {:read-cond :allow :features #{:cljs}} *in*)]
+        (skip-if-eol *in*)
+        input)))
+
 (defn repl [^Context ctx ^Value pr-str*]
-  (loop [state nil
-         buf nil]
-      (let [current-ns (:ns state "user")]
-        (print (if buf "      " (str current-ns "=> ")))
-        (flush)
-        (when-let [line (read-line)]
-          (let [code (if buf (str buf "\n" line) line)]
-            (if (and (not buf) (str/blank? line))
-              (recur state nil)
-              (let [[new-state js] (try (compile-form state code)
-                                        (catch Exception e
-                                          (if (incomplete-input? e)
-                                            [::incomplete nil]
-                                            (do (println "compile error:" (ex-message e))
-                                                nil))))]
-                (cond
-                  (= ::incomplete new-state) (recur state code)
-                  (nil? new-state) (recur state nil)
-                  :else
-                  (do
-                    (when (System/getenv "CHERRY_PRINT_JS")
-                      (println js))
-                    (let [[status ^Value v]
-                          (try (eval-await ctx js)
-                               (catch PolyglotException e
-                                 [:err (.getMessage e)]))]
-                      (if (= :ok status)
-                        (println (.asString (.execute pr-str* (object-array [(.getArrayElement v 0)]))))
-                        (println "error:" (if (instance? Value v)
-                                            (error->str ctx v)
-                                            (str v))))
-                      (recur new-state nil)))))))))))
+  (let [request-prompt (Object.)
+        request-exit   (Object.)
+        repl-state     (atom nil)
+        prompt         #(printf "%s=> " (:ns @repl-state "user"))]
+    (loop []
+      (prompt)
+      (flush)
+      (let [input (try (cljs-repl-read request-prompt request-exit)
+                       (catch Exception e
+                         (binding [*out* *err*]
+                           (println (ex-message e)))
+                         request-prompt))]
+        (when-not (= request-exit input)
+          (when-not (= request-prompt input)
+            (try
+              (let [{:keys [javascript] :as _new-state}
+                    (swap! repl-state #(compile-form input %))]
+                (when (System/getenv "CHERRY_PRINT_JS")
+                  (println javascript))
+                (println (.asString (.execute pr-str* (object-array [(eval-await ctx javascript)])))))
+              (catch Exception e
+                (binding [*out* *err*]
+                  (println (ex-message e))))))
+          (recur))))))
 
 (defn eval-once
   "Eval one expression; prn the result when non-nil. Returns an exit code."
   [^Context ctx ^Value pr-str* ^String code]
-  (let [[_ js] (try (compile-form nil code)
-                    (catch Exception e
-                      (binding [*out* *err*]
-                        (println "compile error:" (ex-message e)))
-                      nil))]
-    (if-not js
+  (let [form (read-string {:read-cond :allow :features #{:cljs}} code)
+        {:keys [javascript] :as _}
+        (try (compile-form form nil)
+             (catch Exception e
+               (binding [*out* *err*]
+                 (println "compile error:" (ex-message e)))
+               nil))]
+    (if-not javascript
       1
-      (let [[status ^Value v] (try (eval-await ctx js)
-                                   (catch PolyglotException e
-                                     [:err (.getMessage e)]))]
-        (if (= :ok status)
-          (let [v (.getArrayElement v 0)]
-            (when-not (.isNull v)
-              (println (.asString (.execute pr-str* (object-array [v])))))
-            0)
+      (try
+        (let [v (eval-await ctx form)]
+          (when-not (.isNull v)
+            (println (.asString (.execute pr-str* (object-array [v])))))
+          0)
+        (catch Exception e
           (binding [*out* *err*]
-            (println "error:" (if (instance? Value v)
-                                (error->str ctx v)
-                                (str v)))
+            (println (ex-message e))
             1))))))
 
 (defn -main [& args]
